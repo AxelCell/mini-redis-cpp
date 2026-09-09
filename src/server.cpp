@@ -112,7 +112,11 @@ int main(int argc, char** argv) {
     ev.data.fd = listen_fd;
     if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &ev) < 0) { perror("epoll_ctl"); return 1; }
 
-    Store store;
+    // Optional second argument caps the keyspace and turns on LRU eviction.
+    size_t max_keys = (argc > 2) ? static_cast<size_t>(std::atoll(argv[2])) : 0;
+    Store store(max_keys);
+    if (max_keys) printf("maxkeys=%zu (LRU eviction enabled)\n", max_keys);
+
     std::unordered_map<int, Conn> conns;
     std::vector<epoll_event> events(kMaxEvents);
 
@@ -139,14 +143,26 @@ int main(int argc, char** argv) {
         return true;
     };
 
+    // The "server cron". epoll_wait returns after at most this many ms even
+    // with no I/O, which gives us a heartbeat for background work -- here,
+    // active expiry. This is how a single-threaded server does periodic tasks
+    // without a second thread or a timer signal.
+    constexpr int kCronMs = 100;
+    int64_t next_cron = now_ms();
+
     while (true) {
-        // -1 = sleep indefinitely. The thread consumes no CPU while idle,
-        // however many thousands of connections are registered.
-        int n = epoll_wait(ep, events.data(), kMaxEvents, -1);
+        int n = epoll_wait(ep, events.data(), kMaxEvents, kCronMs);
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("epoll_wait");
             break;
+        }
+
+        // Reap expired keys nobody has touched. Lazy expiry alone would leak
+        // them forever: a key that is never read is never checked.
+        if (now_ms() >= next_cron) {
+            store.active_expire_cycle();
+            next_cron = now_ms() + kCronMs;
         }
 
         for (int i = 0; i < n; i++) {
