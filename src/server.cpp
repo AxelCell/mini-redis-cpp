@@ -32,6 +32,13 @@ constexpr size_t kReadChunk = 16 * 1024;
 // nothing is ever parsed, so the buffer grows until we run out of memory.
 constexpr size_t kMaxQueryBuf = 64 * 1024 * 1024;
 
+// The same problem in the other direction: a client pipelines thousands of
+// large reads and never reads the replies. Replies pile up in c.out because
+// the socket will not take them. Measured at 818 MB from one connection, which
+// also starved every other client. Drop such a client -- we cannot deliver to
+// it anyway.
+constexpr size_t kMaxOutputBuf = 64 * 1024 * 1024;
+
 // The loop returns to the top after every event, so per-connection state has
 // to live here rather than on the stack.
 struct Conn {
@@ -205,6 +212,7 @@ int main(int argc, char** argv) {
                 }
 
                 // Drain every complete command sitting in the buffer.
+                bool over_output_limit = false;
                 while (!c.close_after_flush) {
                     std::vector<std::string> args;
                     size_t consumed = 0;
@@ -224,7 +232,12 @@ int main(int argc, char** argv) {
                         break;
                     }
                     c.out += execute(store, args);
+
+                    // Stop before the reply backlog eats the server.
+                    if (c.out.size() > kMaxOutputBuf) { over_output_limit = true; break; }
                 }
+
+                if (over_output_limit) { close_conn(fd); continue; }
 
                 if (!flush_out(c)) { close_conn(fd); continue; }
                 if (dead && c.out.empty()) { close_conn(fd); continue; }
