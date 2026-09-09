@@ -3,26 +3,23 @@
 #include <vector>
 #include <cstddef>
 
-// RESP2 -- the Redis wire protocol.
-// Commands arrive as an array of bulk strings:
+// RESP2: commands arrive as an array of bulk strings.
 //   SET foo bar  ->  *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
-// Lengths are explicit, so payloads are binary safe (may contain \r\n or NUL).
+// Lengths are explicit, so payloads may contain \r\n or NUL.
 
 enum class ParseResult {
-    Ok,        // one complete command parsed; `consumed` bytes may be erased
-    NeedMore,  // partial command; nothing consumed, read() more and retry
-    Error,     // protocol violation; reply `err` and close the connection
+    Ok,        // complete command; `consumed` bytes may be erased
+    NeedMore,  // partial command; nothing consumed
+    Error,     // protocol violation; reply `err` and close
 };
 
-// Parses ONE command from the front of `buf`. Does no I/O and does not modify
-// `buf` -- the caller owns the buffer. Keeping this pure is what lets Phase 3
-// swap blocking reads for epoll without changing a line of the parser.
+// Parses one command from the front of `buf`. Does no I/O and never modifies
+// `buf` -- the caller owns the buffer and decides when to erase.
 ParseResult parse_command(const std::string& buf,
                           std::vector<std::string>& args,
                           size_t& consumed,
                           std::string& err);
 
-// --- Reply encoders ---
 std::string reply_simple(const std::string& s);   // +OK\r\n
 std::string reply_error(const std::string& s);    // -ERR ...\r\n
 std::string reply_integer(long long n);           // :42\r\n

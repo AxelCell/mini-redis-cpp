@@ -18,21 +18,9 @@
 #include "store.hpp"
 #include "commands.hpp"
 
-// ---------------------------------------------------------------------------
-// Phase 3: single-threaded epoll event loop.
-//
-// Phase 2 blocked in read() on one client, so 49 of 50 connections sat unserved
-// in the kernel accept queue. Here nothing blocks: every socket is O_NONBLOCK
-// and the kernel tells us which ones are ready.
-//
-// Note what did NOT change: resp.cpp, store.hpp and commands.cpp are untouched.
-// The parser was written as a pure function over a buffer precisely so the I/O
-// strategy could be replaced without touching protocol logic.
-//
-// One thread means no mutexes anywhere: only one command runs at a time, so the
-// Store cannot race with itself. That is the same reason real Redis is
-// single-threaded for command execution.
-// ---------------------------------------------------------------------------
+// Single-threaded epoll event loop. Every socket is non-blocking and the
+// kernel reports which are ready, so one thread serves thousands of clients.
+// Running one command at a time also means the Store needs no locks.
 
 namespace {
 
@@ -40,18 +28,12 @@ constexpr int kDefaultPort = 6380;
 constexpr int kMaxEvents   = 1024;      // events harvested per epoll_wait call
 constexpr size_t kReadChunk = 16 * 1024;
 
-// Cap on unparsed bytes held for one connection.
-//
-// Without this a client announces a huge array ("*1000000\r\n") and then
-// dribbles elements forever. Every read returns NeedMore, so nothing is ever
-// consumed and the buffer grows without bound -- measured at 2 MB of wire data
-// taking the server from 7.8 MB to 14 MB RSS, with no limit in sight. Redis
-// calls this the client query buffer limit and closes offenders the same way.
-constexpr size_t kMaxQueryBuf = 64 * 1024 * 1024;   // 64 MB
+// Without a cap, a client can announce a huge value and then send it slowly:
+// nothing is ever parsed, so the buffer grows until we run out of memory.
+constexpr size_t kMaxQueryBuf = 64 * 1024 * 1024;
 
-// Per-connection state. In Phase 2 this lived in local variables inside
-// serve_client(); the stack frame WAS the state. An event loop returns to the
-// top after every event, so the state must outlive the function call.
+// The loop returns to the top after every event, so per-connection state has
+// to live here rather than on the stack.
 struct Conn {
     int fd = -1;
     std::string in;               // received bytes not yet parsed
@@ -66,8 +48,7 @@ int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Only call epoll_ctl when the mask actually changes. epoll_ctl is a syscall,
-// and at high connection counts calling it on every event is measurable waste.
+// epoll_ctl is a syscall, so skip it when the mask has not changed.
 void update_interest(int ep, Conn& c, uint32_t want) {
     if (c.events == want) return;
     epoll_event ev{};
@@ -88,8 +69,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Writing to a socket whose peer vanished raises SIGPIPE, which by default
-    // KILLS the process. Ignore it and handle EPIPE from write() instead.
+    // Writing to a dead socket raises SIGPIPE, which would kill the process.
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -106,22 +86,20 @@ int main(int argc, char** argv) {
     if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(listen_fd, SOMAXCONN) < 0)                    { perror("listen"); return 1; }
 
-    // The LISTENING socket must be non-blocking too: we accept in a loop until
-    // EAGAIN, and a blocking accept() on an empty queue would stall the loop.
+    // Non-blocking too, since we accept in a loop until EAGAIN.
     if (set_nonblocking(listen_fd) < 0) { perror("fcntl"); return 1; }
 
     int ep = epoll_create1(0);
     if (ep < 0) { perror("epoll_create1"); return 1; }
 
-    // The listening socket is just another fd in the set. That is the key
-    // structural change: accepting is now an event like any other, not
-    // something that only happens between clients.
+    // The listening socket is just another fd in the set, so accepting becomes
+    // an event like any other rather than something between clients.
     epoll_event ev{};
     ev.events  = EPOLLIN;
     ev.data.fd = listen_fd;
     if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &ev) < 0) { perror("epoll_ctl"); return 1; }
 
-    // Optional second argument caps the keyspace and turns on LRU eviction.
+    // Optional second argument caps the keyspace and enables LRU eviction.
     size_t max_keys = (argc > 2) ? static_cast<size_t>(std::atoll(argv[2])) : 0;
     Store store(max_keys);
     if (max_keys) printf("maxkeys=%zu (LRU eviction enabled)\n", max_keys);
@@ -137,25 +115,21 @@ int main(int argc, char** argv) {
         conns.erase(fd);
     };
 
-    // Push as much of c.out as the kernel will take. Returns false if the
-    // connection died.
+    // Push as much of c.out as the kernel takes; false means the peer is gone.
     auto flush_out = [&](Conn& c) -> bool {
         while (!c.out.empty()) {
             ssize_t n = write(c.fd, c.out.data(), c.out.size());
             if (n > 0) { c.out.erase(0, static_cast<size_t>(n)); continue; }
             if (n < 0 && errno == EINTR)  continue;
-            // EAGAIN: kernel send buffer is full. We cannot wait -- keep the
-            // remainder buffered and let epoll tell us when it drains.
+            // Send buffer full: keep the rest and wait for EPOLLOUT.
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-            return false;                       // EPIPE / ECONNRESET etc.
+            return false;
         }
         return true;
     };
 
-    // The "server cron". epoll_wait returns after at most this many ms even
-    // with no I/O, which gives us a heartbeat for background work -- here,
-    // active expiry. This is how a single-threaded server does periodic tasks
-    // without a second thread or a timer signal.
+    // Giving epoll_wait a timeout makes it return even with no I/O, which is
+    // the heartbeat for background work without needing a second thread.
     constexpr int kCronMs = 100;
     int64_t next_cron = now_ms();
 
@@ -167,8 +141,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-        // Reap expired keys nobody has touched. Lazy expiry alone would leak
-        // them forever: a key that is never read is never checked.
+        // Reap expired keys nobody reads -- lazy expiry alone never sees them.
         if (now_ms() >= next_cron) {
             store.active_expire_cycle();
             next_cron = now_ms() + kCronMs;
@@ -178,11 +151,9 @@ int main(int argc, char** argv) {
             int fd = events[i].data.fd;
             uint32_t re = events[i].events;
 
-            // ---------------- new connections ----------------
             if (fd == listen_fd) {
-                // Loop until EAGAIN: one readiness notification can cover MANY
-                // pending connections. Accepting just one per wakeup is a
-                // classic bug that quietly throttles connection throughput.
+                // Loop until EAGAIN: one notification can cover many pending
+                // connections, and accepting only one per wakeup throttles us.
                 while (true) {
                     sockaddr_in cli{};
                     socklen_t len = sizeof(cli);
@@ -193,8 +164,7 @@ int main(int argc, char** argv) {
                         perror("accept4");
                         break;
                     }
-                    // Disable Nagle: we send small replies and do not want the
-                    // kernel delaying them to coalesce with a later write.
+                    // Disable Nagle so small replies are not delayed.
                     int one = 1;
                     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
@@ -210,14 +180,12 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // ---------------- existing connections ----------------
             auto it = conns.find(fd);
             if (it == conns.end()) { epoll_ctl(ep, EPOLL_CTL_DEL, fd, nullptr); close(fd); continue; }
             Conn& c = it->second;
 
             if (re & (EPOLLERR | EPOLLHUP)) { close_conn(fd); continue; }
 
-            // --- readable ---
             if (re & EPOLLIN) {
                 bool dead = false;
                 char chunk[kReadChunk];
@@ -230,16 +198,13 @@ int main(int argc, char** argv) {
                     dead = true; break;
                 }
 
-                // A client that never completes a command must not be able to
-                // grow this buffer forever.
                 if (c.in.size() > kMaxQueryBuf) {
                     c.out += reply_error("ERR Protocol error: query buffer limit exceeded");
                     c.in.clear();
                     c.close_after_flush = true;
                 }
 
-                // Drain every complete command out of the buffer. Identical to
-                // Phase 2 -- the parser did not change.
+                // Drain every complete command sitting in the buffer.
                 while (!c.close_after_flush) {
                     std::vector<std::string> args;
                     size_t consumed = 0;
@@ -248,7 +213,7 @@ int main(int argc, char** argv) {
                     if (r == ParseResult::NeedMore) break;
                     if (r == ParseResult::Error) {
                         c.out += reply_error(err);
-                        c.close_after_flush = true;                  // stream desynced
+                        c.close_after_flush = true;   // stream is desynced now
                         break;
                     }
                     c.in.erase(0, consumed);
@@ -266,16 +231,15 @@ int main(int argc, char** argv) {
                 if (dead) c.close_after_flush = true;
             }
 
-            // --- writable: the send buffer drained, finish a stalled reply ---
+            // Send buffer drained: finish a reply that stalled earlier.
             if (re & EPOLLOUT) {
                 if (!flush_out(c)) { close_conn(fd); continue; }
             }
 
             if (c.close_after_flush && c.out.empty()) { close_conn(fd); continue; }
 
-            // Ask for EPOLLOUT only while we actually have pending bytes.
-            // Leaving it armed on an idle writable socket would spin the loop
-            // at 100% CPU -- the classic level-triggered busy-loop bug.
+            // Only ask for EPOLLOUT while bytes are pending. An idle socket is
+            // always writable, so leaving it armed spins the loop at 100% CPU.
             uint32_t want = EPOLLIN | EPOLLRDHUP | (c.out.empty() ? 0u : EPOLLOUT);
             update_interest(ep, c, want);
         }

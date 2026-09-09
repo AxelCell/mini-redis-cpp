@@ -20,9 +20,8 @@ std::string lower(const std::string& s) {
     return r;
 }
 
-// Errors are CRLF-terminated and NOT length-prefixed, so splicing client text
-// into one lets the client forge a second reply and desync the stream. Scrub
-// CR/LF and cap the length. Real Redis does the same.
+// Error replies end at the first CRLF, so client text containing one would
+// let the client forge a second reply and desync the stream.
 std::string sanitize(const std::string& s) {
     std::string r = s.substr(0, 128);
     for (char& c : r) if (c == '\r' || c == '\n') c = ' ';
@@ -33,7 +32,7 @@ std::string wrong_arity(const std::string& cmd) {
     return reply_error("ERR wrong number of arguments for '" + lower(cmd) + "' command");
 }
 
-// Strict: the whole token must be an integer, like the protocol parser.
+// The whole token must be an integer.
 bool parse_ll(const std::string& s, long long& out) {
     if (s.empty()) return false;
     size_t i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
@@ -50,29 +49,24 @@ bool parse_ll(const std::string& s, long long& out) {
 
 const char* kNotInt = "ERR value is not an integer or out of range";
 
-// Shared implementation of INCR / DECR / INCRBY / DECRBY.
-//
-// Atomicity comes free from the single-threaded event loop: the whole
-// read-modify-write happens inside one command, so no other client can
-// interleave between the read and the write. Doing this from a client with
-// GET then SET would lose updates under concurrency -- two clients both read
-// 5, both write 6, and one increment vanishes.
+// Shared by INCR / DECR / INCRBY / DECRBY. The read-modify-write is atomic
+// because the event loop runs one command at a time -- doing this client-side
+// with GET then SET would lose updates under concurrency.
 std::string incr_by(Store& store, const std::string& key, long long delta) {
-    std::string* v = store.get_mut(key);          // does NOT touch the TTL
+    std::string* v = store.get_mut(key);
 
     long long cur = 0;
     if (v && !parse_ll(*v, cur)) return reply_error(kNotInt);
 
-    // Signed overflow is undefined behaviour, so check before it happens
-    // rather than looking at the result afterwards.
+    // Check before overflowing, since signed overflow is UB.
     if ((delta > 0 && cur > INT64_MAX - delta) ||
         (delta < 0 && cur < INT64_MIN - delta)) {
         return reply_error("ERR increment or decrement would overflow");
     }
     cur += delta;
 
-    if (v) *v = std::to_string(cur);              // in place: TTL survives
-    else   store.set(key, std::to_string(cur));   // new key starts with no TTL
+    if (v) *v = std::to_string(cur);              // in place, so the TTL survives
+    else   store.set(key, std::to_string(cur));
     return reply_integer(cur);
 }
 
@@ -125,7 +119,7 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
     if (cmd == "GET") {
         if (argc != 2) return wrong_arity(cmd);
         const std::string* v = store.get(args[1]);
-        return v ? reply_bulk(*v) : reply_nil();      // $-1 = absent OR expired
+        return v ? reply_bulk(*v) : reply_nil();
     }
 
     if (cmd == "DEL") {
@@ -142,7 +136,6 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
         return reply_integer(n);
     }
 
-    // EXPIRE key seconds  /  PEXPIRE key milliseconds  -> 1 set, 0 no such key
     if (cmd == "EXPIRE" || cmd == "PEXPIRE") {
         if (argc != 3) return wrong_arity(cmd);
         long long n;
@@ -153,13 +146,11 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
         return reply_integer(store.expire(args[1], ms) ? 1 : 0);
     }
 
-    // TTL  -> seconds remaining, -1 = no TTL, -2 = no such key
-    // PTTL -> same in milliseconds
     if (cmd == "TTL" || cmd == "PTTL") {
         if (argc != 2) return wrong_arity(cmd);
         const int64_t ms = store.ttl_ms(args[1]);
-        if (ms < 0) return reply_integer(ms);                 // -1 or -2 pass through
-        return reply_integer(cmd == "TTL" ? (ms + 999) / 1000 : ms);  // round up
+        if (ms < 0) return reply_integer(ms);        // -1 no TTL, -2 no such key
+        return reply_integer(cmd == "TTL" ? (ms + 999) / 1000 : ms);
     }
 
     if (cmd == "PERSIST") {
@@ -167,9 +158,7 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
         return reply_integer(store.persist(args[1]) ? 1 : 0);
     }
 
-    // Atomic counters. A missing key is treated as 0, so the first INCR
-    // returns 1 -- which is what makes the rate-limiter pattern a single
-    // round trip instead of a check-then-create race.
+    // A missing key counts as 0, so the first INCR returns 1.
     if (cmd == "INCR" || cmd == "DECR") {
         if (argc != 2) return wrong_arity(cmd);
         return incr_by(store, args[1], cmd == "INCR" ? 1 : -1);
@@ -180,7 +169,7 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
         long long n;
         if (!parse_ll(args[2], n)) return reply_error(kNotInt);
         if (cmd == "DECRBY") {
-            // -INT64_MIN overflows, so reject it rather than invoking UB.
+            // -INT64_MIN would overflow.
             if (n == INT64_MIN) return reply_error("ERR decrement would overflow");
             n = -n;
         }
