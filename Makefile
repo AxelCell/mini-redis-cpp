@@ -9,17 +9,21 @@ all: server
 server: $(SRC) src/resp.hpp src/store.hpp src/commands.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
 
-test: test_resp test_store
+test: test_resp test_store test_commands
 	./test_resp
 	./test_store
+	./test_commands
 
 test_resp: $(TEST) src/resp.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $(TEST)
 
 clean:
-	rm -f server test_resp test_store
+	rm -f server test_resp test_store test_commands
 
 .PHONY: all test clean
 
 test_store: tests/test_store.cpp src/store.cpp src/store.hpp
 	$(CXX) $(CXXFLAGS) -o $@ tests/test_store.cpp src/store.cpp
+
+test_commands: tests/test_commands.cpp src/commands.cpp src/store.cpp src/resp.cpp
+	$(CXX) $(CXXFLAGS) -o $@ tests/test_commands.cpp src/commands.cpp src/store.cpp src/resp.cpp

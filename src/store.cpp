@@ -88,6 +88,14 @@ const std::string* Store::get(const std::string& k) {
     return &it->second.value;
 }
 
+std::string* Store::get_mut(const std::string& k) {
+    auto it = map_.find(k);
+    if (it == map_.end()) return nullptr;
+    if (expire_if_needed(it)) return nullptr;
+    lru_.splice(lru_.begin(), lru_, it->second.lru);   // counts as use
+    return &it->second.value;                          // expire_at untouched
+}
+
 bool Store::del(const std::string& k) {
     auto it = map_.find(k);
     if (it == map_.end()) return false;

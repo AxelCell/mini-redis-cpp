@@ -1,4 +1,6 @@
 server
 test_resp
 test_store
+test_commands
 *.o
+__pycache__/

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
 
 namespace {
 
@@ -48,6 +49,32 @@ bool parse_ll(const std::string& s, long long& out) {
 }
 
 const char* kNotInt = "ERR value is not an integer or out of range";
+
+// Shared implementation of INCR / DECR / INCRBY / DECRBY.
+//
+// Atomicity comes free from the single-threaded event loop: the whole
+// read-modify-write happens inside one command, so no other client can
+// interleave between the read and the write. Doing this from a client with
+// GET then SET would lose updates under concurrency -- two clients both read
+// 5, both write 6, and one increment vanishes.
+std::string incr_by(Store& store, const std::string& key, long long delta) {
+    std::string* v = store.get_mut(key);          // does NOT touch the TTL
+
+    long long cur = 0;
+    if (v && !parse_ll(*v, cur)) return reply_error(kNotInt);
+
+    // Signed overflow is undefined behaviour, so check before it happens
+    // rather than looking at the result afterwards.
+    if ((delta > 0 && cur > INT64_MAX - delta) ||
+        (delta < 0 && cur < INT64_MIN - delta)) {
+        return reply_error("ERR increment or decrement would overflow");
+    }
+    cur += delta;
+
+    if (v) *v = std::to_string(cur);              // in place: TTL survives
+    else   store.set(key, std::to_string(cur));   // new key starts with no TTL
+    return reply_integer(cur);
+}
 
 } // namespace
 
@@ -138,6 +165,26 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
     if (cmd == "PERSIST") {
         if (argc != 2) return wrong_arity(cmd);
         return reply_integer(store.persist(args[1]) ? 1 : 0);
+    }
+
+    // Atomic counters. A missing key is treated as 0, so the first INCR
+    // returns 1 -- which is what makes the rate-limiter pattern a single
+    // round trip instead of a check-then-create race.
+    if (cmd == "INCR" || cmd == "DECR") {
+        if (argc != 2) return wrong_arity(cmd);
+        return incr_by(store, args[1], cmd == "INCR" ? 1 : -1);
+    }
+
+    if (cmd == "INCRBY" || cmd == "DECRBY") {
+        if (argc != 3) return wrong_arity(cmd);
+        long long n;
+        if (!parse_ll(args[2], n)) return reply_error(kNotInt);
+        if (cmd == "DECRBY") {
+            // -INT64_MIN overflows, so reject it rather than invoking UB.
+            if (n == INT64_MIN) return reply_error("ERR decrement would overflow");
+            n = -n;
+        }
+        return incr_by(store, args[1], n);
     }
 
     if (cmd == "DBSIZE") return reply_integer(static_cast<long long>(store.size()));

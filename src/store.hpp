@@ -35,6 +35,11 @@ public:
     // worth saying out loud: in a cache, reading is a write.
     const std::string* get(const std::string& k);
 
+    // Mutable access to a value WITHOUT disturbing its TTL. INCR must not
+    // reset the expiry -- a rate-limiter counter that renewed its own window
+    // on every increment would never reset. Returns nullptr if absent/expired.
+    std::string* get_mut(const std::string& k);
+
     bool   del(const std::string& k);
     bool   exists(const std::string& k);
     size_t size() const { return map_.size(); }   // may include not-yet-reaped keys

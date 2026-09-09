@@ -50,6 +50,7 @@ flowchart LR
 | `src/resp.cpp` | RESP2 parser and reply encoders — **pure, no I/O** |
 | `src/commands.cpp` | command dispatch and argument validation |
 | `src/store.cpp` | hash map + LRU list + TTL set, lazy and active expiry |
+| `examples/ratelimit.py` | fixed-window rate limiter built on `INCR` + `EXPIRE` |
 
 The parser is a pure function over a buffer:
 
@@ -69,7 +70,46 @@ an epoll loop in Phase 3 changed **zero lines** of protocol code.
 ## Commands
 
 `PING` `ECHO` `SET` (with `EX`/`PX`) `SETEX` `GET` `DEL` `EXISTS` `EXPIRE`
-`PEXPIRE` `TTL` `PTTL` `PERSIST` `DBSIZE` `INFO` `QUIT`
+`PEXPIRE` `TTL` `PTTL` `PERSIST` `INCR` `DECR` `INCRBY` `DECRBY` `DBSIZE`
+`INFO` `QUIT`
+
+### Atomic counters
+
+`INCR` is a server-side read-modify-write, which the single-threaded event loop
+makes atomic for free — no locks, no compare-and-swap. Doing the same thing from
+a client with `GET` then `SET` loses updates under concurrency:
+
+```
+Client A: GET counter -> 5      Client B: GET counter -> 5
+Client A: SET counter 6         Client B: SET counter 6    <- one increment lost
+```
+
+`INCR` also **preserves an existing TTL**, unlike `SET`, which clears it. That
+distinction is what makes the rate-limiter pattern below work — a counter that
+renewed its own window on every increment would never reset.
+
+## Example: API rate limiting
+
+`examples/ratelimit.py` implements fixed-window rate limiting on top of this
+server using only `INCR` and `EXPIRE` — the same pattern that fronts most
+production APIs.
+
+```console
+$ ./server &
+$ python3 examples/ratelimit.py
+policy: 5 requests per 3s window
+
+  request 1: 200 OK          count=1/5  window resets in 3s
+  ...
+  request 6: 429 RATE LIMITED  count=6/5  window resets in 3s
+
+--- new window, counter reset itself via TTL ---
+  request 1: 200 OK          count=1/5
+```
+
+Expired windows are reclaimed by the active-expiry cron, so the keyspace does
+not grow with traffic — the demo ends holding 2 keys regardless of how many
+requests were served.
 
 ---
 
@@ -266,6 +306,7 @@ $ watch -n 0.5 'ss -ltn | grep 6380'
 - [x] RESP protocol parser and core commands
 - [x] epoll event loop
 - [x] TTL expiry (lazy + active) and LRU eviction
+- [x] Atomic counters and a rate-limiter example
 - [ ] Append-only log with crash recovery
 - [ ] Skip list for sorted sets
 - [ ] Leader–follower replication
