@@ -26,8 +26,8 @@ OK
 You need Linux (or WSL on Windows), `g++`, `make`, and `redis-tools`.
 
 ```bash
-git clone https://github.com/<your-username>/kvstore.git
-cd kvstore
+git clone https://github.com/AxelCell/mini-redis-cpp.git
+cd mini-redis-cpp
 make                 # build
 make test            # run all tests
 ./server             # start it on port 6380
@@ -281,13 +281,3 @@ Two tests worth mentioning:
 - [ ] Saving to disk and crash recovery
 - [ ] Sorted sets (skip list)
 - [ ] Replication
-
----
-
-## Acknowledgements
-
-Built with **Claude Code (Claude Opus 5)** as a pair-programming and teaching
-partner. Claude wrote and reviewed much of the implementation; the measurements
-above, the failures they exposed, and the design decisions were worked through
-together. The expiry bottleneck and the memory-exhaustion bug were both found by
-testing rather than by reading the code.
