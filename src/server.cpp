@@ -40,6 +40,15 @@ constexpr int kDefaultPort = 6380;
 constexpr int kMaxEvents   = 1024;      // events harvested per epoll_wait call
 constexpr size_t kReadChunk = 16 * 1024;
 
+// Cap on unparsed bytes held for one connection.
+//
+// Without this a client announces a huge array ("*1000000\r\n") and then
+// dribbles elements forever. Every read returns NeedMore, so nothing is ever
+// consumed and the buffer grows without bound -- measured at 2 MB of wire data
+// taking the server from 7.8 MB to 14 MB RSS, with no limit in sight. Redis
+// calls this the client query buffer limit and closes offenders the same way.
+constexpr size_t kMaxQueryBuf = 64 * 1024 * 1024;   // 64 MB
+
 // Per-connection state. In Phase 2 this lived in local variables inside
 // serve_client(); the stack frame WAS the state. An event loop returns to the
 // top after every event, so the state must outlive the function call.
@@ -219,6 +228,14 @@ int main(int argc, char** argv) {
                     if (errno == EINTR) continue;
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // drained
                     dead = true; break;
+                }
+
+                // A client that never completes a command must not be able to
+                // grow this buffer forever.
+                if (c.in.size() > kMaxQueryBuf) {
+                    c.out += reply_error("ERR Protocol error: query buffer limit exceeded");
+                    c.in.clear();
+                    c.close_after_flush = true;
                 }
 
                 // Drain every complete command out of the buffer. Identical to

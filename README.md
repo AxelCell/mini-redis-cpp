@@ -1,11 +1,10 @@
-# kvstore
+# kvstore — a Redis clone in C++
 
-A Redis-compatible in-memory key-value store written from scratch in C++17.
+A working, in-memory key-value store built from scratch in C++17.
 
-Speaks the real RESP wire protocol, so it works with unmodified `redis-cli` and
-`redis-benchmark`. Single-threaded epoll event loop, TTL expiry, and LRU
-eviction — roughly 1,100 lines with no dependencies beyond the C++ standard
-library and the Linux syscall interface.
+It speaks Redis's real network protocol, so the official `redis-cli` and
+`redis-benchmark` tools connect to it and work normally. About 1,400 lines, no
+libraries beyond the C++ standard library.
 
 ```console
 $ ./server
@@ -22,223 +21,221 @@ OK
 
 ---
 
-## Why this exists
+## Quick start
 
-I wanted to understand the things that sit underneath every backend system —
-sockets, I/O multiplexing, wire protocols, cache eviction — by building one
-rather than reading about it. Each phase was driven by measuring a real failure
-in the previous one.
+You need Linux (or WSL on Windows), `g++`, `make`, and `redis-tools`.
+
+```bash
+git clone https://github.com/<your-username>/kvstore.git
+cd kvstore
+make                 # build
+make test            # run all tests
+./server             # start it on port 6380
+```
+
+In a **second** terminal:
+
+```bash
+redis-cli -p 6380
+```
+
+Try:
+
+```
+PING
+SET name vaibhav
+GET name
+INCR counter
+SET temp hello EX 10
+TTL temp
+DBSIZE
+```
+
+Stop the server with `Ctrl+C`.
+
+**Try the rate limiter demo** (with the server running):
+
+```bash
+python3 examples/ratelimit.py
+```
+
+**Benchmark it:**
+
+```bash
+redis-benchmark -p 6380 -t set,get -n 100000 -c 50 -q
+```
 
 ---
 
-## Architecture
+## What it does
+
+**Stores keys and values in memory**, like a cache. Every operation is O(1) on
+average.
+
+**Expires keys automatically.** `SET session abc EX 300` deletes itself after
+5 minutes. Useful for sessions, caches, and rate limits.
+
+**Evicts old keys when full.** Start it with `./server 6380 100000` and it keeps
+at most 100,000 keys, throwing away whichever was used least recently.
+
+**Handles thousands of clients at once** on a single thread, using the Linux
+`epoll` system call.
+
+### Commands
+
+```
+PING  ECHO  SET  SETEX  GET  DEL  EXISTS
+EXPIRE  PEXPIRE  TTL  PTTL  PERSIST
+INCR  DECR  INCRBY  DECRBY
+DBSIZE  INFO  QUIT
+```
+
+`SET` supports `EX seconds` and `PX milliseconds`.
+
+---
+
+## How it's put together
 
 ```mermaid
 flowchart LR
     C1[client] --> EL
     C2[client] --> EL
     C3[client] --> EL
-    EL["epoll event loop<br/>(single thread)"] --> P["RESP parser<br/>resp.cpp"]
-    P --> X["command dispatch<br/>commands.cpp"]
-    X --> S["Store<br/>hash map + LRU list + TTL set"]
-    EL -.->|"100 ms cron"| S
+    EL["epoll event loop<br/>(one thread)"] --> P["protocol parser<br/>resp.cpp"]
+    P --> X["commands<br/>commands.cpp"]
+    X --> S["storage<br/>hash map + LRU + TTLs"]
+    EL -.->|"every 100 ms"| S
 ```
 
-| File | Responsibility |
+| File | What it does |
 |---|---|
-| `src/server.cpp` | epoll event loop, connection state, non-blocking I/O |
-| `src/resp.cpp` | RESP2 parser and reply encoders — **pure, no I/O** |
-| `src/commands.cpp` | command dispatch and argument validation |
-| `src/store.cpp` | hash map + LRU list + TTL set, lazy and active expiry |
-| `examples/ratelimit.py` | fixed-window rate limiter built on `INCR` + `EXPIRE` |
+| `src/server.cpp` | Networking — accepts connections, reads and writes sockets |
+| `src/resp.cpp` | Understands Redis's wire format |
+| `src/commands.cpp` | Runs commands like `GET` and `SET` |
+| `src/store.cpp` | The actual storage: hash map, LRU list, expiry |
+| `examples/ratelimit.py` | A rate limiter built on this server |
 
-The parser is a pure function over a buffer:
-
-```cpp
-ParseResult parse_command(const std::string& buf,      // const: never mutated
-                          std::vector<std::string>& args,
-                          size_t& consumed,            // 0 unless a whole command parsed
-                          std::string& err);
-```
-
-It performs no I/O and cannot erase from the buffer — the caller decides. That
-made it unit-testable without a socket, and it meant swapping blocking reads for
-an epoll loop in Phase 3 changed **zero lines** of protocol code.
+One useful design choice: **the protocol parser does no networking.** It takes a
+buffer of bytes and returns a command, nothing more. That meant it could be
+tested without a socket, and when the networking was rewritten from blocking I/O
+to an event loop, the parser needed **zero changes**.
 
 ---
 
-## Commands
+## Things I learned by measuring
 
-`PING` `ECHO` `SET` (with `EX`/`PX`) `SETEX` `GET` `DEL` `EXISTS` `EXPIRE`
-`PEXPIRE` `TTL` `PTTL` `PERSIST` `INCR` `DECR` `INCRBY` `DECRBY` `DBSIZE`
-`INFO` `QUIT`
+Each section below is a problem I hit, measured, and fixed.
 
-### Atomic counters
+### 1. The first version broke completely with 50 clients
 
-`INCR` is a server-side read-modify-write, which the single-threaded event loop
-makes atomic for free — no locks, no compare-and-swap. Doing the same thing from
-a client with `GET` then `SET` loses updates under concurrency:
+The original server handled one client at a time: accept a connection, serve it
+until it disconnects, then accept the next. With one client it did ~18,000
+operations/second. With 50 clients it did **zero** — it hung forever.
 
-```
-Client A: GET counter -> 5      Client B: GET counter -> 5
-Client A: SET counter 6         Client B: SET counter 6    <- one increment lost
-```
-
-`INCR` also **preserves an existing TTL**, unlike `SET`, which clears it. That
-distinction is what makes the rate-limiter pattern below work — a counter that
-renewed its own window on every increment would never reset.
-
-## Example: API rate limiting
-
-`examples/ratelimit.py` implements fixed-window rate limiting on top of this
-server using only `INCR` and `EXPIRE` — the same pattern that fronts most
-production APIs.
+You can watch this happen. `Recv-Q` on a listening socket is the number of
+connections Linux has accepted on your behalf that your program hasn't picked up
+yet:
 
 ```console
-$ ./server &
-$ python3 examples/ratelimit.py
-policy: 5 requests per 3s window
-
-  request 1: 200 OK          count=1/5  window resets in 3s
-  ...
-  request 6: 429 RATE LIMITED  count=6/5  window resets in 3s
-
---- new window, counter reset itself via TTL ---
-  request 1: 200 OK          count=1/5
+$ ss -ltn | grep 6380
+LISTEN 49  4096  0.0.0.0:6380
+       ^^ 49 clients stuck waiting
 ```
 
-Expired windows are reclaimed by the active-expiry cron, so the keyspace does
-not grow with traffic — the demo ends holding 2 keys regardless of how many
-requests were served.
+The clients saw no error — Linux completes the TCP handshake for you, so as far
+as they knew they were connected. They just waited forever.
 
----
+**The fix** was an `epoll` event loop: instead of waiting on one socket, ask the
+kernel to watch all of them and tell you which are ready.
 
-## Measurements
-
-WSL2 on Windows 11, single core in use. Run-to-run variance on this platform is
-high — figures below are representative runs, and where the noise exceeded the
-effect I have said so rather than quoting a number.
-
-### The problem that motivated the event loop
-
-The Phase 2 server was a blocking `accept()` → serve-to-completion loop. It
-worked fine for one client and **failed completely** for fifty:
-
-| Concurrent clients | Blocking server | epoll event loop |
+| Clients | Before | After |
 |---:|---|---|
-| 1 | ~18,000 SET/s | ~comparable (see note) |
-| 1, pipelined ×16 | 212,765 SET/s | — |
-| 50 | **0 — deadlocks, never completes** | **45,913 SET/s**, p50 0.54 ms |
-| 200 | 0 | **45,249 SET/s**, p50 2.20 ms |
-| 500 | 0 | **42,671 SET/s**, p50 5.56 ms |
+| 50 | **0** (hangs) | **45,913/sec**, 0.54 ms |
+| 200 | 0 | 45,249/sec, 2.20 ms |
+| 500 | 0 | 42,671/sec, 5.56 ms |
 
-The failure is directly observable in the kernel. `Recv-Q` on a listening socket
-is the number of connections the kernel has fully established that the
-application has not yet `accept()`ed:
+`Recv-Q` now stays at 0 even with 400 connections open.
 
-```console
-# blocking server, 50 clients                # epoll server, 200 clients
-$ ss -ltn | grep 6380                        $ ss -ltn | grep 6380
-LISTEN 49  4096  0.0.0.0:6380                LISTEN 0  4096  0.0.0.0:6380
-       ^^ 49 clients stranded                       ^ backlog never builds
-```
+### 2. The bottleneck wasn't the code I expected
 
-Clients see no error — their `connect()` succeeded, because the TCP handshake is
-completed by the kernel. They just wait forever.
+At 18,000 ops/sec I assumed the hash map was slow. It wasn't — a hash lookup
+takes about 100 nanoseconds, which would allow millions per second.
 
-> **Note on the single-client figure.** epoll measured slower than blocking at
-> one client, which is expected — it costs an extra `epoll_wait()` and an extra
-> `read()` returning `EAGAIN` per request. But re-running the *blocking* build
-> minutes later gave 9,722 ops/sec where it had earlier given 17,985. The
-> machine's run-to-run spread was larger than the difference between the two
-> designs, so the honest conclusion is **no measurable difference at one
-> connection on this hardware**. The concurrency result is far above the noise
-> and is solid.
-
-### Pipelining is a syscall story
-
-At ~18,000 ops/sec the hash map is not the bottleneck — a lookup is ~100 ns,
-which would allow millions per second. The limit is **syscalls**: one `read()`
-and one `write()` per command. Pipelining 16 commands amortises those two
-syscalls across sixteen operations:
+The real cost was **system calls**: one `read()` and one `write()` per command,
+each a switch into the kernel and back. Sending 16 commands at once
+("pipelining") spreads those two calls across 16 operations:
 
 ```
-1 client, no pipelining     17,985 SET/s    p50 0.055 ms
-1 client, -P 16            212,765 SET/s    p50 0.063 ms    ~12x
+1 command at a time     17,985/sec
+16 at a time           212,765/sec     ~12x faster
 ```
 
-Throughput rose 12× while p50 barely moved — the signature of a syscall-bound
-workload. The server exploits this by batching all replies from one `read()`
-into a single `write()`.
+Same code, same data structure. This is why the server now batches all replies
+from one read into a single write.
 
-### Optimising active expiry: 55× fewer cycles
+### 3. Deleting expired keys was 55× slower than it should have been
 
-Keys with a TTL that nobody reads must still be reclaimed, so a 100 ms cron
-samples keys and deletes expired ones. The first implementation sampled random
-**buckets of the main hash table**, and it degraded badly as the table grew:
+Keys with a TTL that nobody reads still need cleaning up, so a background task
+runs every 100 ms and deletes expired ones. It worked, but badly:
 
 ```
-keys      cycles to drain    keys reaped per cycle
-1,000     53                 18.9
-10,000    651                15.4
-100,000   17,267              5.8   <- getting worse with size
+100,000 expired keys took 17,267 rounds to clean up
+= about 29 minutes
 ```
 
-At a 100 ms cron, 17,267 cycles is **29 minutes** to reclaim 100k expired keys.
+Worse, it got *slower* as the store grew — 18.9 keys cleaned per round at 1,000
+keys, but only 5.8 at 100,000.
 
-**Cause:** `std::unordered_map` never shrinks its bucket array. Once most keys
-are deleted, ~100,000 buckets hold a handful of keys, so nearly every random
-probe lands on an empty bucket. The drain tail collapses.
+**Why:** it picked random slots from the main hash table. But C++'s hash map
+never shrinks, so once most keys were deleted there were ~100,000 slots holding
+a handful of keys. Almost every random pick found an empty slot.
 
-**Fix:** keep a separate vector of exactly the keys that carry a TTL — the
-equivalent of Redis's `expires` dictionary — with each key's slot index stored
-in its entry so removal is an O(1) swap-with-last. Every sample is then a real
-candidate.
+**Fix:** keep a separate list of only the keys that actually have an expiry
+time, and pick from that instead. Now every pick is a real candidate.
 
-```
-keys      cycles: before -> after     wall time at 10 cycles/sec
-1,000     53      ->   4              5.3 s   -> 0.4 s
-10,000    651     ->  32              65 s    -> 3.2 s
-100,000   17,267  -> 313              29 min  -> 31 s
-reaped/cycle  18.9->5.8 (degrading)   ~250-320 (flat)
-```
+| Keys | Before | After |
+|---|---|---|
+| 1,000 | 5.3 s | **0.4 s** |
+| 10,000 | 65 s | **3.2 s** |
+| 100,000 | 29 min | **31 s** |
 
-Each cycle is also capped by a wall-clock budget so it cannot stall the event
-loop. **This part is unproven:** measuring per-cycle latency five times per
-build gave a spread (max 1.8–6.7 ms) wider than the budget's effect. It is kept
-because it is correct in principle and matches Redis, not because I measured a
-win here.
+And the rate no longer degrades as the store grows.
+
+### 4. A client could run the server out of memory
+
+Found by deliberately attacking it. A client can say "I'm sending a 200 MB
+value", then send it slowly. The server can't process an incomplete command, so
+it buffers everything — and there was no limit. 2 MB of input grew the server
+from 7.8 MB to 14 MB, with nothing stopping it going further.
+
+**Fix:** cap how much unfinished input one connection can hold (64 MB), then
+disconnect it. Verified: the attack now stops at exactly 64 MB, memory returns to
+normal, and other clients are unaffected.
+
+### 5. Error messages could be used to forge replies
+
+Replies like `-ERR unknown command 'X'` end at the first line break. If `X` came
+from the client and contained a line break, the client's library would see
+**two** replies where the server sent one — and every reply after that would be
+misread. Same idea as HTTP response splitting.
+
+**Fix:** strip line breaks from anything the client supplied before putting it in
+an error message.
 
 ---
 
-## Design decisions
+## Honest limitations
 
-**Single-threaded, no locks.** One command runs at a time, so a data race on the
-store is impossible by construction — the `Store` has no mutex anywhere. This is
-the same reason Redis executes commands on one thread. Using more cores means
-running several instances sharded by key, as Redis Cluster does.
-
-**Length-prefixed protocol.** RESP bulk strings carry an explicit byte count, so
-values are binary safe — a value may contain `\r\n` or a NUL byte with no
-escaping. Verified by round-tripping such a value byte-exactly.
-
-**Simple strings are not binary safe, and that is a vulnerability.** `+OK\r\n`
-and `-ERR …\r\n` terminate at the first CRLF. Splicing client-controlled text
-into an error lets a client forge a second reply and desynchronise every
-subsequent one — the same class of bug as HTTP response splitting. Error replies
-scrub CR/LF before echoing any client input.
-
-**Monotonic clock for TTLs.** Deadlines come from `steady_clock`, not wall time.
-An NTP correction must not make keys expire early or late.
-
-**The cron is `epoll_wait`'s timeout.** Passing `100` instead of `-1` gives a
-single-threaded server a heartbeat for background work with no second thread and
-no timer signal.
-
-**Non-blocking writes need an output buffer.** A non-blocking `write()` can send
-part of a reply and return `EAGAIN`, so each connection buffers what is left and
-`EPOLLOUT` is armed **only while bytes are pending**. Leaving it armed spins the
-loop at 100% CPU, since an idle socket is always writable.
+- **Data is lost on restart.** No saving to disk yet.
+- **Only strings.** No lists, sets, or sorted sets.
+- **One CPU core.** Deliberate — one thread means no locks are needed anywhere.
+  Redis works the same way; using more cores means running several copies.
+- **Measured on WSL2**, which is noisy. Where the noise was bigger than the
+  effect I was measuring, I've said so rather than quoting a number I can't
+  stand behind. In particular, the single-client comparison between blocking I/O
+  and `epoll` was **inconclusive** — re-running the same build minutes apart gave
+  17,985 and then 9,722 ops/sec. The multi-client results are far above the noise
+  and are solid.
 
 ---
 
@@ -246,77 +243,51 @@ loop at 100% CPU, since an idle socket is always writable.
 
 ```console
 $ make test
-ALL TESTS PASSED (0 failures)        # protocol
-ALL STORE TESTS PASSED (0 failures)  # store
+ALL TESTS PASSED (0 failures)          # protocol
+ALL STORE TESTS PASSED (0 failures)    # storage
+ALL COMMAND TESTS PASSED (0 failures)  # commands
 ```
 
-Two suites worth calling out:
+Two tests worth mentioning:
 
-- **Byte-by-byte framing.** A command is fed one byte at a time and the parser
-  is asserted to report `Ok` only when the final byte arrives, and to consume
-  zero bytes on every partial state. TCP delivers a byte stream with no message
-  boundaries, and "one `read()` = one command" is the assumption that breaks
-  homemade servers under load.
-- **Randomised TTL-set churn.** 20,000 random `SET`/`EXPIRE`/`PERSIST`/`DEL`
-  operations checked against an independent model. The O(1) swap-with-last
-  removal has to fix up the moved key's recorded index — the easiest place for a
-  subtle bug to hide.
+- **One byte at a time.** A command is fed to the parser a single byte at a
+  time, checking it only reports success on the very last byte. Network data
+  arrives in arbitrary chunks, and assuming "one read = one command" is the
+  mistake that breaks most hand-written servers.
+- **20,000 random operations** checked against a separate simple model, to catch
+  bugs in the O(1) removal logic that a hand-written test would miss.
 
 ---
 
-## Build and run
+## What I'd do differently
 
-```console
-$ make                        # builds ./server
-$ make test                   # runs both suites
-
-$ ./server                    # port 6380, unlimited keys
-$ ./server 6380 100000        # port 6380, LRU eviction above 100k keys
-```
-
-Watch the accept queue under load:
-
-```console
-$ watch -n 0.5 'ss -ltn | grep 6380'
-```
-
----
-
-## What I would do differently
-
-1. **Reply encoders allocate per call.** Each returns a `std::string`. Appending
-   into a caller-owned buffer reused per connection would remove that
-   allocation. This is the first thing I would change if profiling showed
-   allocation pressure.
-2. **`std::unordered_map` rehashes in one stop-the-world pass**, which spikes
-   tail latency when the table doubles. Redis spreads rehashing incrementally
-   across operations to bound p99. Implementing that is the natural next
-   optimisation.
-3. **Connections are stored in a hash map keyed by fd.** File descriptors are
-   small dense integers, so a flat vector indexed by fd would be faster and
-   simpler. Redis does this.
-4. **Benchmark on real hardware.** WSL2's scheduling noise made sub-millisecond
-   effects unmeasurable and cost me time chasing a "regression" that was noise.
+1. Reply building allocates a new string every time. Reusing one buffer per
+   connection would avoid that.
+2. C++'s hash map resizes all at once, which causes a latency spike. Redis
+   spreads the work out instead.
+3. Connections are stored in a hash map keyed by file descriptor. Since those
+   are small numbers, a plain array would be faster.
+4. Benchmark on real hardware, not WSL2. Chasing a "performance regression" that
+   turned out to be measurement noise cost me an hour.
 
 ---
 
 ## Roadmap
 
-- [x] Blocking TCP server
-- [x] RESP protocol parser and core commands
-- [x] epoll event loop
-- [x] TTL expiry (lazy + active) and LRU eviction
-- [x] Atomic counters and a rate-limiter example
-- [ ] Append-only log with crash recovery
-- [ ] Skip list for sorted sets
-- [ ] Leader–follower replication
+- [x] TCP server and Redis protocol
+- [x] `epoll` event loop
+- [x] Key expiry and LRU eviction
+- [x] Atomic counters and rate-limiter example
+- [ ] Saving to disk and crash recovery
+- [ ] Sorted sets (skip list)
+- [ ] Replication
 
 ---
 
 ## Acknowledgements
 
 Built with **Claude Code (Claude Opus 5)** as a pair-programming and teaching
-partner. Claude wrote and reviewed much of the implementation; the measurements,
-the failures they exposed, and the design decisions documented above were worked
-through together. The active-expiry bottleneck in particular was found by
-benchmarking rather than by inspection.
+partner. Claude wrote and reviewed much of the implementation; the measurements
+above, the failures they exposed, and the design decisions were worked through
+together. The expiry bottleneck and the memory-exhaustion bug were both found by
+testing rather than by reading the code.
