@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <cstddef>
 
-// Monotonic, not wall-clock: an NTP correction must not expire keys early.
+// Wall-clock milliseconds since the Unix epoch. Must be wall-clock, not
+// monotonic: expiry deadlines are written to the append-only log and have to
+// still mean something after a restart.
 int64_t now_ms();
 
 // Hash map for O(1) lookup, plus a list holding keys in use order. Each entry
@@ -30,14 +32,46 @@ public:
     size_t size() const { return map_.size(); }
 
     bool expire(const std::string& k, int64_t ttl_ms);
+
+    // Set expiry to an absolute wall-clock deadline rather than a duration.
+    // The append-only log records deadlines this way: logging "EX 100" and
+    // replaying it an hour later would wrongly revive the key with a fresh
+    // 100 seconds, instead of leaving it long expired.
+    bool expire_at(const std::string& k, int64_t deadline_ms);
+
+    // The raw deadline (0 = none), for writing state out to the log.
+    int64_t deadline_of(const std::string& k);
+
     bool persist(const std::string& k);
     int64_t ttl_ms(const std::string& k);                // -2 absent, -1 no TTL
 
     static constexpr int64_t kExpireBudgetUs = 1000;
     size_t active_expire_cycle(size_t samples = 20);
 
+    // Visit every live key as fn(key, value, deadline). Skips keys whose
+    // deadline has already passed but which have not been reaped yet.
+    template <class F>
+    void for_each(F fn) const {
+        const int64_t now = now_ms();
+        for (const auto& kv : map_) {
+            const int64_t d = kv.second.expire_at;
+            if (d != 0 && now >= d) continue;
+            fn(kv.first, kv.second.value, d);
+        }
+    }
+
     size_t evicted() const { return evicted_; }
     size_t expired() const { return expired_; }
+
+    // Keys dropped by LRU eviction since the last call, and clears the list.
+    // The append-only log has to record these. Expiry does not need it -- a
+    // logged absolute deadline already in the past deletes the key on replay --
+    // but eviction depends on access history the log does not carry.
+    std::vector<std::string> take_evicted_keys() {
+        std::vector<std::string> out;
+        out.swap(evicted_keys_);
+        return out;
+    }
 
 private:
     static constexpr size_t kNoVol = static_cast<size_t>(-1);
@@ -64,6 +98,7 @@ private:
     // most keys are gone, random bucket probes almost always land on empty
     // buckets and the cleanup tail collapses.
     std::vector<std::string> vol_;
+    std::vector<std::string> evicted_keys_;
     size_t max_keys_ = 0;
     size_t evicted_  = 0;
     size_t expired_  = 0;

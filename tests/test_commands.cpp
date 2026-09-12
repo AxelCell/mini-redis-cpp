@@ -61,6 +61,25 @@ int main() {
         check(run(s, {"TTL", "fresh"}) == ":-1\r\n", "new counter is persistent until EXPIREd");
     }
 
+    printf("\n=== PEXPIREAT ===\n");
+    {
+        Store s;
+        run(s, {"SET", "k", "v"});
+        const std::string when = std::to_string(now_ms() + 50000);
+        check(run(s, {"PEXPIREAT", "k", when}) == ":1\r\n", "sets an absolute deadline -> 1");
+        const std::string ttl = run(s, {"TTL", "k"});
+        check(ttl != ":-1\r\n" && ttl != ":-2\r\n", "TTL now reports a value");
+
+        run(s, {"SET", "old", "v"});
+        const std::string past = std::to_string(now_ms() - 10000);
+        check(run(s, {"PEXPIREAT", "old", past}) == ":1\r\n", "past deadline deletes -> 1");
+        check(run(s, {"EXISTS", "old"}) == ":0\r\n", "key is gone");
+
+        check(run(s, {"PEXPIREAT", "ghost", when}) == ":0\r\n", "missing key -> 0");
+        check(run(s, {"PEXPIREAT", "k", "abc"}).rfind("-ERR", 0) == 0, "non-numeric -> error");
+        check(run(s, {"PEXPIREAT", "k"}).rfind("-ERR", 0) == 0, "wrong arity -> error");
+    }
+
     printf("\n=== arity ===\n");
     {
         Store s;

@@ -2,5 +2,7 @@ server
 test_resp
 test_store
 test_commands
+test_aof
 *.o
+*.aof
 __pycache__/

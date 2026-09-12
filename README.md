@@ -31,6 +31,9 @@ cd mini-redis-cpp
 make                 # build
 make test            # run all tests
 ./server             # start it on port 6380
+
+# with persistence
+./server 6380 --aof data.aof --fsync everysec
 ```
 
 In a **second** terminal:
@@ -81,13 +84,16 @@ at most 100,000 keys, throwing away whichever was used least recently.
 **Handles thousands of clients at once** on a single thread, using the Linux
 `epoll` system call.
 
+**Survives a crash.** With `--aof`, every write goes to an append-only log
+before the client is told it succeeded, and the log is replayed on startup.
+
 ### Commands
 
 ```
 PING  ECHO  SET  SETEX  GET  DEL  EXISTS
-EXPIRE  PEXPIRE  TTL  PTTL  PERSIST
+EXPIRE  PEXPIRE  PEXPIREAT  TTL  PTTL  PERSIST
 INCR  DECR  INCRBY  DECRBY
-DBSIZE  INFO  QUIT
+DBSIZE  INFO  BGREWRITEAOF  QUIT
 ```
 
 `SET` supports `EX seconds` and `PX milliseconds`.
@@ -113,6 +119,7 @@ flowchart LR
 | `src/resp.cpp` | Understands Redis's wire format |
 | `src/commands.cpp` | Runs commands like `GET` and `SET` |
 | `src/store.cpp` | The actual storage: hash map, LRU list, expiry |
+| `src/aof.cpp` | Append-only log: writing, recovery, compaction |
 | `examples/ratelimit.py` | A rate limiter built on this server |
 
 One useful design choice: **the protocol parser does no networking.** It takes a
@@ -212,7 +219,39 @@ from 7.8 MB to 14 MB, with nothing stopping it going further.
 disconnect it. Verified: the attack now stops at exactly 64 MB, memory returns to
 normal, and other clients are unaffected.
 
-### 5. Error messages could be used to forge replies
+### 5. Persistence: replying before the log was on disk lost data
+
+With an append-only log added, I wrote a crash test: kill the server with
+`SIGKILL` mid-write, restart, and check that every write the server had
+*acknowledged* was still there. Fifteen crashes, and fifteen keys missing --
+exactly one per crash, always the last one acknowledged.
+
+The cause was ordering. The server sent `+OK` to the client and only flushed
+the log afterwards, so a crash in that window lost a write the client believed
+had committed. That is the opposite of what "write-ahead" means: the log has to
+be durable *before* the acknowledgement. Moving the flush ahead of the reply
+fixed it -- 964/964 acknowledged writes survived 15 `SIGKILL`s.
+
+A crash also leaves the last record half written. That is expected, not
+corruption: recovery discards the incomplete tail and truncates the file to the
+last clean record. Tested at every single truncation point of a 5-record log.
+
+**What fsync costs**, 50 clients on ext4:
+
+| Policy | ops/sec | p50 | you lose on power failure |
+|---|---:|---:|---|
+| `no` | 79,365 | 0.32 ms | whatever the OS still holds |
+| `everysec` | 120,967 | 0.22 ms | up to 1 second |
+| `always` | **227** | **221 ms** | nothing |
+
+`no` and `everysec` are the same within noise -- neither syncs per write.
+`always` costs about 99.8% of throughput, which is why almost nobody runs it.
+
+I first measured this on `/tmp` and got 0.24 ms for `always`, which looked
+suspiciously cheap. `/tmp` is tmpfs -- RAM -- where `fsync` does nothing. The
+numbers above are from ext4.
+
+### 6. Error messages could be used to forge replies
 
 Replies like `-ERR unknown command 'X'` end at the first line break. If `X` came
 from the client and contained a line break, the client's library would see
@@ -226,8 +265,9 @@ an error message.
 
 ## Honest limitations
 
-- **Data is lost on restart.** No saving to disk yet.
 - **Only strings.** No lists, sets, or sorted sets.
+- **Compaction is synchronous.** Redis forks a child so the parent keeps
+  serving; this pauses for as long as it takes to write the keyspace out.
 - **One CPU core.** Deliberate — one thread means no locks are needed anywhere.
   Redis works the same way; using more cores means running several copies.
 - **Measured on WSL2**, which is noisy. Where the noise was bigger than the
@@ -278,6 +318,6 @@ Two tests worth mentioning:
 - [x] `epoll` event loop
 - [x] Key expiry and LRU eviction
 - [x] Atomic counters and rate-limiter example
-- [ ] Saving to disk and crash recovery
+- [x] Append-only log, crash recovery and compaction
 - [ ] Sorted sets (skip list)
 - [ ] Replication

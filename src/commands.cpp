@@ -72,6 +72,23 @@ std::string incr_by(Store& store, const std::string& key, long long delta) {
 
 } // namespace
 
+std::vector<std::string> write_keys(const std::vector<std::string>& args) {
+    if (args.size() < 2) return {};
+    const std::string cmd = upper(args[0]);
+
+    // Single-key writers.
+    if (cmd == "SET" || cmd == "SETEX" || cmd == "EXPIRE" || cmd == "PEXPIRE" ||
+        cmd == "PEXPIREAT" || cmd == "PERSIST" || cmd == "INCR" || cmd == "DECR" ||
+        cmd == "INCRBY" || cmd == "DECRBY") {
+        return {args[1]};
+    }
+
+    // DEL is variadic.
+    if (cmd == "DEL") return {args.begin() + 1, args.end()};
+
+    return {};   // GET, EXISTS, TTL, PTTL, DBSIZE, INFO, PING, ECHO, ...
+}
+
 std::string execute(Store& store, const std::vector<std::string>& args) {
     if (args.empty()) return "";
 
@@ -144,6 +161,17 @@ std::string execute(Store& store, const std::vector<std::string>& args) {
         // A non-positive TTL deletes the key immediately, as Redis does.
         if (ms <= 0) return reply_integer(store.del(args[1]) ? 1 : 0);
         return reply_integer(store.expire(args[1], ms) ? 1 : 0);
+    }
+
+    // PEXPIREAT key <unix-ms> -- absolute deadline. Used by the append-only log
+    // so a replayed expiry means the same instant it originally meant.
+    if (cmd == "PEXPIREAT") {
+        if (argc != 3) return wrong_arity(cmd);
+        long long ms;
+        if (!parse_ll(args[2], ms)) return reply_error(kNotInt);
+        // A deadline already in the past deletes the key, as Redis does.
+        if (ms <= now_ms()) return reply_integer(store.del(args[1]) ? 1 : 0);
+        return reply_integer(store.expire_at(args[1], ms) ? 1 : 0);
     }
 
     if (cmd == "TTL" || cmd == "PTTL") {

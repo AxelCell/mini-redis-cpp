@@ -13,10 +13,12 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <cctype>
 
 #include "resp.hpp"
 #include "store.hpp"
 #include "commands.hpp"
+#include "aof.hpp"
 
 // Single-threaded epoll event loop. Every socket is non-blocking and the
 // kernel reports which are ready, so one thread serves thousands of clients.
@@ -68,12 +70,39 @@ void update_interest(int ep, Conn& c, uint32_t want) {
 
 int main(int argc, char** argv) {
     int port = kDefaultPort;
-    if (argc > 1) {
-        port = std::atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "usage: %s [port]\n", argv[0]);
-            return 1;
-        }
+    size_t max_keys = 0;
+    std::string aof_path;
+    Aof::Sync aof_sync = Aof::Sync::EverySec;
+
+    auto usage = [&]() {
+        fprintf(stderr,
+                "usage: %s [port] [maxkeys] [--aof FILE] [--fsync always|everysec|no]\n",
+                argv[0]);
+    };
+
+    int positional = 0;
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--aof") {
+            if (++i >= argc) { usage(); return 1; }
+            aof_path = argv[i];
+        } else if (a == "--fsync") {
+            if (++i >= argc) { usage(); return 1; }
+            const std::string p = argv[i];
+            if      (p == "always")   aof_sync = Aof::Sync::Always;
+            else if (p == "everysec") aof_sync = Aof::Sync::EverySec;
+            else if (p == "no")       aof_sync = Aof::Sync::No;
+            else { usage(); return 1; }
+        } else if (!a.empty() && a[0] == '-') {
+            usage(); return 1;
+        } else if (positional == 0) {
+            port = std::atoi(a.c_str());
+            if (port <= 0 || port > 65535) { usage(); return 1; }
+            positional++;
+        } else if (positional == 1) {
+            max_keys = static_cast<size_t>(std::atoll(a.c_str()));
+            positional++;
+        } else { usage(); return 1; }
     }
 
     // Writing to a dead socket raises SIGPIPE, which would kill the process.
@@ -106,10 +135,34 @@ int main(int argc, char** argv) {
     ev.data.fd = listen_fd;
     if (epoll_ctl(ep, EPOLL_CTL_ADD, listen_fd, &ev) < 0) { perror("epoll_ctl"); return 1; }
 
-    // Optional second argument caps the keyspace and enables LRU eviction.
-    size_t max_keys = (argc > 2) ? static_cast<size_t>(std::atoll(argv[2])) : 0;
     Store store(max_keys);
     if (max_keys) printf("maxkeys=%zu (LRU eviction enabled)\n", max_keys);
+
+    // Recover before accepting anyone, so the first client sees a complete
+    // dataset rather than one that is still filling in.
+    Aof aof;
+    if (!aof_path.empty()) {
+        size_t applied = 0, torn = 0;
+        std::string aerr;
+        if (!Aof::load(aof_path, store, applied, torn, aerr)) {
+            fprintf(stderr, "aof: %s\n", aerr.c_str());
+            return 1;
+        }
+        if (applied || torn)
+            printf("aof: replayed %zu records, %zu keys restored%s\n",
+                   applied, store.size(),
+                   torn ? "" : "");
+        if (torn)
+            printf("aof: discarded %zu bytes of a partially written trailing "
+                   "record (expected after a crash)\n", torn);
+        if (!aof.open(aof_path, aof_sync, aerr)) {
+            fprintf(stderr, "aof: %s\n", aerr.c_str());
+            return 1;
+        }
+        const char* sname = aof_sync == Aof::Sync::Always   ? "always"
+                          : aof_sync == Aof::Sync::EverySec ? "everysec" : "no";
+        printf("aof: %s (fsync=%s)\n", aof_path.c_str(), sname);
+    }
 
     std::unordered_map<int, Conn> conns;
     std::vector<epoll_event> events(kMaxEvents);
@@ -152,7 +205,22 @@ int main(int argc, char** argv) {
         if (now_ms() >= next_cron) {
             store.active_expire_cycle();
             next_cron = now_ms() + kCronMs;
+
+            if (aof.enabled() && aof.should_rewrite()) {
+                const size_t before = aof.bytes_written();
+                std::string rerr;
+                if (aof.rewrite(aof_path, store, rerr))
+                    printf("aof: rewrote log, %zu -> %zu bytes\n",
+                           before, aof.bytes_written());
+                else
+                    fprintf(stderr, "aof: rewrite failed: %s\n", rerr.c_str());
+            }
         }
+
+        // Catches anything buffered with no reply pending, and drives the
+        // once-a-second fsync when the policy is everysec.
+        if (aof.enabled() && !aof.flush())
+            fprintf(stderr, "aof: write failed: %s\n", strerror(errno));
 
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
@@ -226,6 +294,22 @@ int main(int argc, char** argv) {
                     }
                     c.in.erase(0, consumed);
                     if (args.empty()) continue;
+                    if (args.size() == 1 && aof.enabled()) {
+                        std::string up = args[0];
+                        for (char& ch : up) ch = static_cast<char>(toupper(
+                            static_cast<unsigned char>(ch)));
+                        if (up == "BGREWRITEAOF") {
+                            std::string rerr;
+                            if (aof.rewrite(aof_path, store, rerr)) {
+                                c.out += reply_simple("Background append only file "
+                                                      "rewriting started");
+                            } else {
+                                c.out += reply_error("ERR " + rerr);
+                            }
+                            continue;
+                        }
+                    }
+
                     if (args.size() == 1 && (args[0] == "QUIT" || args[0] == "quit")) {
                         c.out += reply_simple("OK");
                         c.close_after_flush = true;
@@ -233,11 +317,29 @@ int main(int argc, char** argv) {
                     }
                     c.out += execute(store, args);
 
+                    if (aof.enabled()) {
+                        for (const auto& k : write_keys(args)) aof.log_key(store, k);
+                        // Eviction is not reproducible from the data, so the
+                        // log has to carry the deletions explicitly.
+                        for (const auto& k : store.take_evicted_keys())
+                            aof.log_key(store, k);
+                    }
+
                     // Stop before the reply backlog eats the server.
                     if (c.out.size() > kMaxOutputBuf) { over_output_limit = true; break; }
                 }
 
                 if (over_output_limit) { close_conn(fd); continue; }
+
+                // WRITE-AHEAD: the log must be durable BEFORE the client is
+                // told the write succeeded. Replying first means a crash in
+                // that window loses a write the client believes committed --
+                // measured at exactly one lost key per crash before this moved.
+                if (aof.enabled() && !aof.flush()) {
+                    fprintf(stderr, "aof: write failed: %s\n", strerror(errno));
+                    close_conn(fd);
+                    continue;
+                }
 
                 if (!flush_out(c)) { close_conn(fd); continue; }
                 if (dead && c.out.empty()) { close_conn(fd); continue; }

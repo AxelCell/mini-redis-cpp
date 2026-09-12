@@ -97,6 +97,32 @@ int main() {
         check(s.evicted() == 0, "evicted counter still 0");
     }
 
+    printf("\n=== absolute deadlines (expire_at / deadline_of) ===\n");
+    {
+        Store s;
+        s.set("k", "v");
+        check(s.deadline_of("k") == 0, "no deadline on a plain key");
+        const int64_t when = now_ms() + 50000;
+        check(s.expire_at("k", when), "expire_at on an existing key");
+        check(s.deadline_of("k") == when, "deadline stored exactly, not as a duration");
+        const int64_t left = s.ttl_ms("k");
+        check(left > 49000 && left <= 50000, "TTL derived from the deadline");
+        check(!s.expire_at("ghost", when), "expire_at on a missing key -> false");
+        check(s.deadline_of("ghost") == 0, "deadline_of on a missing key -> 0");
+
+        // A deadline already past must make the key read as gone.
+        s.set("old", "v");
+        s.expire_at("old", now_ms() - 1000);
+        check(!s.exists("old"), "past deadline -> key is gone");
+        check(s.get("old") == nullptr, "past deadline -> GET misses");
+
+        // persist() must clear a deadline set this way too.
+        s.set("p", "v");
+        s.expire_at("p", now_ms() + 50000);
+        check(s.persist("p"), "persist clears an absolute deadline");
+        check(s.deadline_of("p") == 0, "deadline cleared");
+    }
+
     printf("\n=== TTL-set invariant under random churn ===\n");
     {
         // The active-expiry sample set (vol_) is maintained with a

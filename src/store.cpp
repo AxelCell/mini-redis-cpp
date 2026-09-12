@@ -3,9 +3,17 @@
 #include <random>
 #include <vector>
 
+// Wall-clock, not monotonic. A monotonic clock counts from an arbitrary point
+// and restarts with the machine, so a deadline written to disk would be
+// meaningless after a reboot -- persistence needs timestamps that survive one.
+// The cost is that a large clock correction shifts expiry times; Redis makes
+// the same trade for the same reason.
+//
+// Note this is only for DEADLINES. Measuring an elapsed duration (the expiry
+// cycle's time budget below) still uses steady_clock, which cannot jump.
 int64_t now_ms() {
     using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 void Store::vol_add(Map::iterator it) {
@@ -51,6 +59,7 @@ void Store::evict_if_needed() {
         auto it = map_.find(victim);
         if (it == map_.end()) { lru_.pop_back(); continue; }
         erase_entry(it);
+        evicted_keys_.push_back(victim);
         evicted_++;
     }
 }
@@ -111,6 +120,22 @@ bool Store::expire(const std::string& k, int64_t ttl) {
     it->second.expire_at = now_ms() + ttl;
     vol_add(it);
     return true;
+}
+
+bool Store::expire_at(const std::string& k, int64_t deadline_ms) {
+    auto it = map_.find(k);
+    if (it == map_.end()) return false;
+    if (expire_if_needed(it)) return false;
+    it->second.expire_at = deadline_ms;
+    vol_add(it);
+    return true;
+}
+
+int64_t Store::deadline_of(const std::string& k) {
+    auto it = map_.find(k);
+    if (it == map_.end()) return 0;
+    if (expire_if_needed(it)) return 0;
+    return it->second.expire_at;
 }
 
 bool Store::persist(const std::string& k) {
